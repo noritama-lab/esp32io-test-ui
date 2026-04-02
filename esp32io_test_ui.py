@@ -1,0 +1,506 @@
+import sys
+from PySide6.QtWidgets import (
+    QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
+    QStatusBar, QMessageBox, QFrame, QButtonGroup,
+)
+from PySide6.QtCore import Qt, QTimer, QThread, QObject, Signal, Slot
+from PySide6.QtGui import QFont
+from pyside6stylekit import (
+    Theme, IndusAlternateButton, IndusLamp,
+    StyledButton, StyledLabel, StyledGroupBox, StyledSlider,
+    StyledLineEdit, StyledCheckBox, StyledRadioButton,
+    StyledComboBox, StyledProgressBar, StyledTextEdit,
+)
+
+from esp32io import ESP32IO
+import serial
+from serial.tools import list_ports
+
+
+class ESP32Worker(QObject):
+    connected = Signal()
+    connection_failed = Signal(str)
+    disconnected = Signal()
+    di_adc_updated = Signal(list, list)
+    do_done = Signal(int, int)
+    do_failed = Signal(int, str)
+    command_failed = Signal(str)
+
+    def __init__(self):
+        super().__init__()
+        self.esp = None
+        self._refreshing = False
+
+    @Slot(str)
+    def do_connect(self, port: str):
+        try:
+            self.esp = ESP32IO(port, debug=False, recv_timeout=3.0)
+            self.connected.emit()
+        except Exception as e:
+            self.esp = None
+            self.connection_failed.emit(str(e))
+
+    @Slot()
+    def do_disconnect(self):
+        try:
+            if self.esp:
+                self.esp.close()
+        except Exception:
+            pass
+        finally:
+            self.esp = None
+            self.disconnected.emit()
+
+    @Slot()
+    def do_refresh(self):
+        if not self.esp or self._refreshing:
+            return
+        self._refreshing = True
+        try:
+            di_values = [self.esp.read_di(i) for i in range(6)]
+            adc_values = [self.esp.read_adc(i) for i in range(2)]
+            self.di_adc_updated.emit(di_values, adc_values)
+        except Exception as e:
+            self.command_failed.emit(f"更新失敗: {str(e)}")
+        finally:
+            self._refreshing = False
+
+    @Slot(int, int)
+    def do_set_do(self, pin_id: int, value: int):
+        if not self.esp:
+            return
+        try:
+            self.esp.set_do(pin_id, value)
+            self.do_done.emit(pin_id, value)
+        except Exception as e:
+            self.do_failed.emit(pin_id, str(e))
+
+    @Slot(int, int)
+    def do_set_pwm(self, pin_id: int, value: int):
+        if not self.esp:
+            return
+        try:
+            self.esp.set_pwm(pin_id, value)
+        except Exception as e:
+            self.command_failed.emit(f"set_pwm 失敗 (PIN{pin_id}): {str(e)}")
+
+
+class ESP32IOTestUI(QMainWindow):
+    _connect_requested = Signal(str)
+    _disconnect_requested = Signal()
+    _refresh_requested = Signal()
+    _set_do_requested = Signal(int, int)
+    _set_pwm_requested = Signal(int, int)
+    def __init__(self):
+        super().__init__()
+        self._connected = False
+
+        # テーマ設定
+        self.theme_title = Theme(
+            primary="green", mode="dark", size="large",
+            background="transparent", text_color="white"
+        )
+        self.theme_bgtrans = Theme(
+            primary="green", mode="dark", size="small",
+            background="transparent", text_color="white"
+        )
+        self.theme_btn_lamp = Theme(
+            primary="green", mode="dark", size="small",
+            text_color="white"
+        )
+
+        self.auto_refresh_timer = QTimer()
+        self.auto_refresh_timer.timeout.connect(self.refresh_di_adc)
+
+        self.setWindowTitle("ESP32IO Test UI")
+        self.setGeometry(100, 100, 520, 820)
+
+        # UI コンポーネントの辞書
+        self.dio_buttons = {}      # pin_id: IndusAlternateButton
+        self.di_lamps = {}         # pin_id: IndusLamp
+        self.adc_labels = {}       # pin_id: StyledLabel
+        self.adc_progress = {}     # pin_id: StyledProgressBar
+        self.pwm_sliders = {}      # pin_id: (StyledSlider, StyledLabel, StyledProgressBar)
+
+        # Worker スレッド設定
+        self._worker = ESP32Worker()
+        self._thread = QThread(self)
+        self._worker.moveToThread(self._thread)
+        self._thread.start()
+
+        # Worker → UI シグナル接続
+        self._worker.connected.connect(self._on_connected)
+        self._worker.connection_failed.connect(self._on_connection_failed)
+        self._worker.disconnected.connect(self._on_disconnected)
+        self._worker.di_adc_updated.connect(self._on_di_adc_updated)
+        self._worker.do_done.connect(self._on_do_done)
+        self._worker.do_failed.connect(self._on_do_failed)
+        self._worker.command_failed.connect(self._on_command_failed)
+
+        # UI → Worker シグナル接続
+        self._connect_requested.connect(self._worker.do_connect)
+        self._disconnect_requested.connect(self._worker.do_disconnect)
+        self._refresh_requested.connect(self._worker.do_refresh)
+        self._set_do_requested.connect(self._worker.do_set_do)
+        self._set_pwm_requested.connect(self._worker.do_set_pwm)
+
+        self.setup_ui()
+
+    def setup_ui(self):
+        """UI コンポーネントを設定"""
+        central_widget = QWidget()
+        central_widget.setStyleSheet("background-color: #1f1f1f;")
+        self.setCentralWidget(central_widget)
+        main_layout = QVBoxLayout(central_widget)
+
+        title = StyledLabel("ESP32IO Test UI", theme=self.theme_title)
+        main_layout.addWidget(title)
+
+        # ===== 接続設定 =====
+        connection_group = StyledGroupBox("接続設定", theme=self.theme_bgtrans)
+        conn_layout = QVBoxLayout()
+
+        port_row = QHBoxLayout()
+        port_row.addWidget(StyledLabel("COM ポート:", theme=self.theme_bgtrans))
+        self.port_combo = StyledComboBox(self.theme_btn_lamp, self.get_available_ports())
+        self.port_combo.setMinimumWidth(140)
+        port_row.addWidget(self.port_combo)
+
+        self.refresh_ports_btn = StyledButton("再読込", theme=self.theme_btn_lamp)
+        self.refresh_ports_btn.clicked.connect(self.refresh_ports)
+        port_row.addWidget(self.refresh_ports_btn)
+        conn_layout.addLayout(port_row)
+
+        button_row = QHBoxLayout()
+        self.connect_btn = StyledButton("接続", theme=self.theme_btn_lamp)
+        self.connect_btn.clicked.connect(self.connect_esp32)
+        button_row.addWidget(self.connect_btn)
+
+        self.disconnect_btn = StyledButton("切断", theme=self.theme_btn_lamp)
+        self.disconnect_btn.clicked.connect(self.disconnect_esp32)
+        self.disconnect_btn.setEnabled(False)
+        button_row.addWidget(self.disconnect_btn)
+
+        self.auto_refresh_btn = StyledButton("自動更新: OFF", theme=self.theme_btn_lamp)
+        self.auto_refresh_btn.setCheckable(True)
+        self.auto_refresh_btn.toggled.connect(self.toggle_auto_refresh)
+        self.auto_refresh_btn.setEnabled(False)
+        button_row.addWidget(self.auto_refresh_btn)
+        conn_layout.addLayout(button_row)
+
+        connection_group.setLayout(conn_layout)
+        main_layout.addWidget(connection_group)
+
+        # ===== 追加の styled widget 設定 =====
+        styled_group = StyledGroupBox("Styled Widget 設定", theme=self.theme_bgtrans)
+        styled_layout = QVBoxLayout()
+
+        styled_layout.addWidget(StyledLabel("更新間隔 (100〜5000 ms)", theme=self.theme_bgtrans))
+        self.refresh_interval_input = StyledLineEdit(
+            "例: 500", self.theme_btn_lamp,
+            mode="numeric_range", min_val=100, max_val=5000
+        )
+        self.refresh_interval_input.setText("500")
+        styled_layout.addWidget(self.refresh_interval_input)
+
+        self.auto_connect_refresh = StyledCheckBox(
+            "接続時に自動更新を開始", self.theme_bgtrans, checked=True
+        )
+        styled_layout.addWidget(self.auto_connect_refresh)
+
+        radio_row = QHBoxLayout()
+        radio_row.addWidget(StyledLabel("更新モード:", theme=self.theme_bgtrans))
+        self.normal_refresh_radio = StyledRadioButton("標準", self.theme_bgtrans)
+        self.fast_refresh_radio = StyledRadioButton("高速", self.theme_bgtrans)
+        self.normal_refresh_radio.setChecked(True)
+        self.refresh_mode_group = QButtonGroup(self)
+        self.refresh_mode_group.addButton(self.normal_refresh_radio)
+        self.refresh_mode_group.addButton(self.fast_refresh_radio)
+        radio_row.addWidget(self.normal_refresh_radio)
+        radio_row.addWidget(self.fast_refresh_radio)
+        radio_row.addStretch()
+        styled_layout.addLayout(radio_row)
+
+        styled_group.setLayout(styled_layout)
+        main_layout.addWidget(styled_group)
+
+        # ===== DIO 出力（ボタン6個） =====
+        do_group = StyledGroupBox("DIO 出力 - set_do (PIN 0~5)", theme=self.theme_bgtrans)
+        do_layout = QHBoxLayout()
+        for i in range(6):
+            btn = IndusAlternateButton(f"PIN{i}", self.theme_btn_lamp, diameter=48)
+            btn.toggled.connect(lambda checked, pin_id=i: self.on_do_toggle(pin_id, checked))
+            self.dio_buttons[i] = btn
+            do_layout.addWidget(btn)
+        do_group.setLayout(do_layout)
+        main_layout.addWidget(do_group)
+
+        # ===== DIO 入力（ランプ6個） =====
+        di_group = StyledGroupBox("DIO 入力 - read_di (PIN 0~5)", theme=self.theme_bgtrans)
+        di_layout = QHBoxLayout()
+        for i in range(6):
+            lamp = IndusLamp(f"PIN{i}", self.theme_btn_lamp, diameter=48, state=False)
+            self.di_lamps[i] = lamp
+            di_layout.addWidget(lamp)
+        di_group.setLayout(di_layout)
+        main_layout.addWidget(di_group)
+
+        # ===== ADC 読み取り（表示 + ProgressBar） =====
+        adc_group = StyledGroupBox("ADC 読み取り - read_adc (PIN 0~1)", theme=self.theme_bgtrans)
+        adc_layout = QHBoxLayout()
+        for i in range(2):
+            frame = QFrame()
+            frame.setFrameStyle(QFrame.Box | QFrame.Raised)
+            frame.setLineWidth(2)
+            layout = QVBoxLayout()
+
+            label = StyledLabel(f"PIN{i}", theme=self.theme_bgtrans)
+            label.setAlignment(Qt.AlignCenter)
+            label.setFont(QFont("Arial", 10, QFont.Bold))
+
+            value = StyledLabel("0", theme=self.theme_bgtrans)
+            value.setAlignment(Qt.AlignCenter)
+            value.setFont(QFont("Arial", 14, QFont.Bold))
+
+            progress = StyledProgressBar(self.theme_btn_lamp, 0, 4095, 0)
+            progress.setFormat("%v / 4095")
+
+            layout.addWidget(label)
+            layout.addWidget(value)
+            layout.addWidget(progress)
+            frame.setLayout(layout)
+
+            self.adc_labels[i] = value
+            self.adc_progress[i] = progress
+            adc_layout.addWidget(frame)
+        adc_group.setLayout(adc_layout)
+        main_layout.addWidget(adc_group)
+
+        # ===== PWM 出力（スライダー + ProgressBar） =====
+        pwm_group = StyledGroupBox("PWM 出力 - set_pwm (PIN 0~1)", theme=self.theme_bgtrans)
+        pwm_layout = QHBoxLayout()
+        for i in range(2):
+            frame = QFrame()
+            frame.setFrameStyle(QFrame.Box | QFrame.Raised)
+            frame.setLineWidth(2)
+            layout = QVBoxLayout()
+
+            label = StyledLabel(f"PIN{i}", theme=self.theme_bgtrans)
+            label.setAlignment(Qt.AlignCenter)
+            label.setFont(QFont("Arial", 10, QFont.Bold))
+
+            slider = StyledSlider(theme=self.theme_bgtrans, min_val=0, max_val=255, value=0)
+            slider.valueChanged.connect(lambda value, pin_id=i: self.on_pwm_change(pin_id, value))
+
+            value_label = StyledLabel("0", theme=self.theme_bgtrans)
+            value_label.setAlignment(Qt.AlignCenter)
+            value_label.setFont(QFont("Arial", 12, QFont.Bold))
+            value_label.setMinimumWidth(40)
+
+            progress = StyledProgressBar(self.theme_btn_lamp, 0, 255, 0)
+            progress.setFormat("%v / 255")
+
+            slider.valueChanged.connect(lambda value, label=value_label: label.setText(str(value)))
+            slider.valueChanged.connect(lambda value, bar=progress: bar.setValue(value))
+
+            layout.addWidget(label)
+            layout.addWidget(slider)
+            layout.addWidget(value_label)
+            layout.addWidget(progress)
+            frame.setLayout(layout)
+
+            self.pwm_sliders[i] = (slider, value_label, progress)
+            pwm_layout.addWidget(frame)
+        pwm_group.setLayout(pwm_layout)
+        main_layout.addWidget(pwm_group)
+
+        # ===== イベントログ =====
+        log_group = StyledGroupBox("イベントログ", theme=self.theme_bgtrans)
+        log_layout = QVBoxLayout()
+        self.log_text = StyledTextEdit(
+            self.theme_bgtrans,
+            "UI を初期化しました。\n使える styled widget をすべて表示しています。"
+        )
+        self.log_text.setReadOnly(True)
+        self.log_text.setMinimumHeight(120)
+        log_layout.addWidget(self.log_text)
+        log_group.setLayout(log_layout)
+        main_layout.addWidget(log_group)
+
+        # ステータスバー
+        self.statusBar = QStatusBar()
+        self.setStatusBar(self.statusBar)
+        self.statusBar.showMessage("切断状態")
+
+        # 初期状態：ボタン無効化
+        self.set_buttons_enabled(False)
+
+    def append_log(self, message: str):
+        """ログ表示を追加"""
+        self.log_text.append(message)
+
+    def get_refresh_interval(self) -> int:
+        """入力値とモードから更新間隔を決定"""
+        interval = 500
+
+        if self.refresh_interval_input.is_valid():
+            self.refresh_interval_input.show_error("")
+            try:
+                interval = int(self.refresh_interval_input.value())
+            except (TypeError, ValueError):
+                interval = int(self.refresh_interval_input.edit.text() or 500)
+        else:
+            self.refresh_interval_input.show_error("100〜5000 の範囲で入力してください")
+
+        if self.fast_refresh_radio.isChecked():
+            interval = max(100, interval // 2)
+
+        return interval
+
+    def refresh_ports(self):
+        """COM ポート一覧を再読込"""
+        current_port = self.port_combo.currentText()
+        ports = self.get_available_ports()
+        self.port_combo.clear()
+        self.port_combo.addItems(ports)
+        if current_port in ports:
+            self.port_combo.setCurrentText(current_port)
+        self.connect_btn.setEnabled(bool(ports) and not self._connected)
+        if not ports:
+            self.append_log("利用可能な COM ポートが見つかりません。")
+        self.append_log("COM ポート一覧を更新しました。")
+
+    def get_available_ports(self):
+        """利用可能な COM ポートを取得"""
+        ports = [p.device for p in list_ports.comports()]
+        return ports
+
+    def connect_esp32(self):
+        """ESP32 に接続"""
+        port = self.port_combo.currentText()
+        if not port:
+            self.append_log("接続失敗: COM ポートが選択されていません。")
+            QMessageBox.warning(self, "エラー", "利用可能な COM ポートがありません。")
+            return
+        self.connect_btn.setEnabled(False)
+        self.append_log(f"{port} に接続中...")
+        self._connect_requested.emit(port)
+
+    def disconnect_esp32(self):
+        """ESP32 から切断"""
+        self.auto_refresh_timer.stop()
+        self.auto_refresh_btn.blockSignals(True)
+        self.auto_refresh_btn.setChecked(False)
+        self.auto_refresh_btn.blockSignals(False)
+        self.auto_refresh_btn.setText("自動更新: OFF")
+        self.disconnect_btn.setEnabled(False)
+        self._disconnect_requested.emit()
+
+    def set_buttons_enabled(self, enabled: bool):
+        """操作ボタンの有効/無効を設定"""
+        for btn in self.dio_buttons.values():
+            btn.setEnabled(enabled)
+        for slider, _, _ in self.pwm_sliders.values():
+            slider.setEnabled(enabled)
+        self.auto_refresh_btn.setEnabled(enabled)
+
+    def on_do_toggle(self, pin_id: int, checked: bool = None):
+        """DIO 出力ボタンがトグルされた"""
+        if not self._connected:
+            return
+        if checked is None:
+            checked = self.dio_buttons[pin_id].isChecked()
+        value = 1 if checked else 0
+        self._set_do_requested.emit(pin_id, value)
+
+    def on_pwm_change(self, pin_id: int, value: int):
+        """PWM スライダーが変更された"""
+        if not self._connected:
+            return
+        self._set_pwm_requested.emit(pin_id, value)
+
+    def toggle_auto_refresh(self, checked: bool):
+        """自動更新をトグル"""
+        if checked:
+            interval = self.get_refresh_interval()
+            self.auto_refresh_btn.setText(f"自動更新: ON ({interval}ms)")
+            self.auto_refresh_timer.start(interval)
+            self.append_log(f"自動更新を開始しました ({interval} ms)。")
+        else:
+            self.auto_refresh_btn.setText("自動更新: OFF")
+            self.auto_refresh_timer.stop()
+            self.append_log("自動更新を停止しました。")
+
+    def refresh_di_adc(self):
+        """DIO入力と ADC を更新（Worker スレッドへ委譲）"""
+        if not self._connected:
+            return
+        self._refresh_requested.emit()
+
+    # --- Worker からのコールバック ---
+
+    def _on_connected(self):
+        self._connected = True
+        port = self.port_combo.currentText()
+        self.statusBar.showMessage(f"接続完了: {port}")
+        self.append_log(f"{port} に接続しました。")
+        self.set_buttons_enabled(True)
+        self.disconnect_btn.setEnabled(True)
+        self.port_combo.setEnabled(False)
+        self.refresh_ports_btn.setEnabled(False)
+        self._refresh_requested.emit()
+        if self.auto_connect_refresh.isChecked():
+            self.auto_refresh_btn.setChecked(True)
+
+    def _on_connection_failed(self, error: str):
+        self.append_log(f"接続失敗: {error}")
+        self.connect_btn.setEnabled(True)
+        QMessageBox.critical(self, "エラー", f"接続失敗: {error}")
+
+    def _on_disconnected(self):
+        self._connected = False
+        self.statusBar.showMessage("切断状態")
+        self.append_log("ESP32 から切断しました。")
+        self.set_buttons_enabled(False)
+        self.connect_btn.setEnabled(True)
+        self.disconnect_btn.setEnabled(False)
+        self.port_combo.setEnabled(True)
+        self.refresh_ports_btn.setEnabled(True)
+
+    def _on_di_adc_updated(self, di_values: list, adc_values: list):
+        for pin_id, value in enumerate(di_values):
+            self.di_lamps[pin_id].set_state(value)
+        for pin_id, value in enumerate(adc_values):
+            self.adc_labels[pin_id].setText(str(value))
+            self.adc_progress[pin_id].setValue(value)
+
+    def _on_do_done(self, pin_id: int, value: int):
+        self.append_log(f"DO PIN{pin_id} -> {value}")
+
+    def _on_do_failed(self, pin_id: int, error: str):
+        self.append_log(f"set_do 失敗 (PIN{pin_id}): {error}")
+        self.dio_buttons[pin_id].blockSignals(True)
+        self.dio_buttons[pin_id].setChecked(not self.dio_buttons[pin_id].isChecked())
+        self.dio_buttons[pin_id].blockSignals(False)
+        QMessageBox.warning(self, "エラー", f"set_do 失敗: {error}")
+
+    def _on_command_failed(self, error: str):
+        self.append_log(error)
+
+    def closeEvent(self, event):
+        self.auto_refresh_timer.stop()
+        self._disconnect_requested.emit()
+        self._thread.quit()
+        self._thread.wait(3000)
+        super().closeEvent(event)
+
+
+def main():
+    app = QApplication(sys.argv)
+    ui = ESP32IOTestUI()
+    ui.show()
+    sys.exit(app.exec())
+
+
+if __name__ == "__main__":
+    main()
