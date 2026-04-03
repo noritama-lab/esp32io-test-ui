@@ -1,10 +1,9 @@
 import sys
-import time
 from PySide6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
     QStatusBar, QMessageBox, QFrame,
 )
-from PySide6.QtCore import Qt, QTimer, QThread, QObject, Signal, Slot
+from PySide6.QtCore import Qt, QTimer, QThread, Signal
 from PySide6.QtGui import QFont
 from pyside6stylekit import (
     Theme, IndusAlternateButton, IndusLamp,
@@ -13,113 +12,42 @@ from pyside6stylekit import (
     StyledComboBox, StyledProgressBar, StyledTextEdit, utils
 )
 
-from esp32io import ESP32IO
+from esp32_worker import ESP32Worker
 from serial.tools import list_ports
 
 
-class ESP32Worker(QObject):
-    connected = Signal()
-    connection_failed = Signal(str)
-    disconnected = Signal()
-    di_adc_updated = Signal(list, list, float)
-    do_done = Signal(int, int)
-    do_failed = Signal(int, str)
-    command_failed = Signal(str)
-
-    def __init__(self):
-        super().__init__()
-        self.esp = None
-        self._refreshing = False
-
-    @Slot(str)
-    def do_connect(self, port: str):
-        try:
-            self.esp = ESP32IO(port, debug=False, recv_timeout=1.0)
-            if not self.esp.ping():
-                try:
-                    self.esp.close()
-                except Exception:
-                    pass
-                self.esp = None
-                self.connection_failed.emit("ping 応答がありません")
-                return
-            self.connected.emit()
-        except Exception as e:
-            self.esp = None
-            self.connection_failed.emit(str(e))
-
-    @Slot()
-    def do_disconnect(self):
-        try:
-            if self.esp:
-                self.esp.close()
-        except Exception:
-            pass
-        finally:
-            self.esp = None
-            self.disconnected.emit()
-
-    @Slot()
-    def do_refresh(self):
-        if not self.esp or self._refreshing:
-            return
-        self._refreshing = True
-        try:
-            start = time.perf_counter()
-            di_values = [self.esp.read_di(i) for i in range(6)]
-            adc_values = [self.esp.read_adc(i) for i in range(2)]
-            elapsed_ms = (time.perf_counter() - start) * 1000.0
-            self.di_adc_updated.emit(di_values, adc_values, elapsed_ms)
-        except Exception as e:
-            self.command_failed.emit(f"更新失敗: {str(e)}")
-        finally:
-            self._refreshing = False
-
-    @Slot(int, int)
-    def do_set_do(self, pin_id: int, value: int):
-        if not self.esp:
-            return
-        try:
-            self.esp.set_do(pin_id, value)
-            self.do_done.emit(pin_id, value)
-        except Exception as e:
-            self.do_failed.emit(pin_id, str(e))
-
-    @Slot(int, int)
-    def do_set_pwm(self, pin_id: int, value: int):
-        if not self.esp:
-            return
-        try:
-            self.esp.set_pwm(pin_id, value)
-        except Exception as e:
-            self.command_failed.emit(f"set_pwm 失敗 (PIN{pin_id}): {str(e)}")
-
-
 class ESP32IOTestUI(QMainWindow):
+    # UIスレッドからWorkerスレッドへ処理依頼するための中継シグナル
     _connect_requested = Signal(str)
     _disconnect_requested = Signal()
     _refresh_requested = Signal()
     _set_do_requested = Signal(int, int)
     _set_pwm_requested = Signal(int, int)
+    _get_pwm_config_requested = Signal()
+    _set_pwm_config_requested = Signal(int, int)
     def __init__(self):
         super().__init__()
         self._connected = False
 
         # テーマ設定
         self.theme_title = Theme(
-            primary="green", mode="dark", size="large",
+            primary="blue", mode="dark", size="large",
             background="transparent", text_color="white"
         )
         self.theme_bgtrans = Theme(
-            primary="green", mode="dark", size="small",
+            primary="blue", mode="dark", size="small",
             background="transparent", text_color="white"
         )
         self.theme_btn_lamp = Theme(
-            primary="green", mode="dark", size="small",
+            primary="blue", mode="dark", size="small",
             text_color="white"
         )
+        self.theme_input = Theme(
+            primary="blue", mode="dark", size="small",
+            background="#cccccc", text_color="black"
+        )
         self.theme_btn_off = Theme(
-            primary=utils.adjust_color(utils.normalize_color("green"), 0.2), 
+            primary=utils.adjust_color(utils.normalize_color("blue"), 0.2), 
             mode="dark", size="small", text_color="white"
         )
 
@@ -136,6 +64,8 @@ class ESP32IOTestUI(QMainWindow):
         self.adc_labels = {}       # pin_id: StyledLabel
         self.adc_bars = {}         # pin_id: StyledProgressBar
         self.pwm_sliders = {}      # pin_id: (StyledSlider, StyledLabel)
+        self.pwm_config_freq = None  # Current PWM frequency
+        self.pwm_config_res = None   # Current PWM resolution
 
         # Worker スレッド設定
         self._worker = ESP32Worker()
@@ -151,6 +81,8 @@ class ESP32IOTestUI(QMainWindow):
         self._worker.do_done.connect(self._on_do_done)
         self._worker.do_failed.connect(self._on_do_failed)
         self._worker.command_failed.connect(self._on_command_failed)
+        self._worker.pwm_config_updated.connect(self._on_pwm_config_updated)
+        self._worker.pwm_config_failed.connect(self._on_pwm_config_failed)
 
         # UI → Worker シグナル接続
         self._connect_requested.connect(self._worker.do_connect)
@@ -158,6 +90,8 @@ class ESP32IOTestUI(QMainWindow):
         self._refresh_requested.connect(self._worker.do_refresh)
         self._set_do_requested.connect(self._worker.do_set_do)
         self._set_pwm_requested.connect(self._worker.do_set_pwm)
+        self._get_pwm_config_requested.connect(self._worker.do_get_pwm_config)
+        self._set_pwm_config_requested.connect(self._worker.do_set_pwm_config)
 
         self.setup_ui()
 
@@ -174,13 +108,47 @@ class ESP32IOTestUI(QMainWindow):
         title = StyledLabel("ESP32IO Test UI", theme=self.theme_title)
         main_layout.addWidget(title)
 
-        # ===== 接続設定 =====
+        main_row1.addWidget(self._create_connection_group())
+        main_row1.addWidget(self._create_auto_refresh_group())
+        main_row1.setStretch(0, 1)
+        main_row1.setStretch(1, 1)
+
+        main_row2.addWidget(self._create_di_group())
+        main_row2.addWidget(self._create_do_group())
+        main_row2.setStretch(0, 1)
+        main_row2.setStretch(1, 1)
+
+        main_row3.addWidget(self._create_adc_group())
+        main_row3.addWidget(self._create_pwm_group())
+        main_row3.addWidget(self._create_pwm_config_group())
+        main_row3.setStretch(0, 1)
+        main_row3.setStretch(1, 1)
+        main_row3.setStretch(2, 1)
+
+        log_group = self._create_log_group()
+
+
+        # main_layoutへの追加
+        main_layout.addLayout(main_row1)
+        main_layout.addLayout(main_row2)
+        main_layout.addLayout(main_row3)
+        main_layout.addWidget(log_group)
+
+        # ステータスバー
+        self.statusBar = QStatusBar()
+        self.setStatusBar(self.statusBar)
+        self.statusBar.showMessage("切断状態")
+
+        # 初期状態：ボタン無効化
+        self.set_buttons_enabled(False)
+
+    def _create_connection_group(self):
         connection_group = StyledGroupBox("接続設定", theme=self.theme_bgtrans)
         conn_layout = QVBoxLayout()
 
         port_rayout = QHBoxLayout()
         port_rayout.addWidget(StyledLabel("COM ポート:", theme=self.theme_bgtrans))
-        self.port_combo = StyledComboBox(self.theme_btn_lamp, self.get_available_ports())
+        self.port_combo = StyledComboBox(self.theme_input, self.get_available_ports())
         self.port_combo.setMinimumWidth(140)
         port_rayout.addWidget(self.port_combo)
 
@@ -207,15 +175,15 @@ class ESP32IOTestUI(QMainWindow):
         conn_layout.addLayout(button_rayout)
 
         connection_group.setLayout(conn_layout)
-        main_row1.addWidget(connection_group)
+        return connection_group
 
-        # ===== 追加設定 =====
+    def _create_auto_refresh_group(self):
         styled_group = StyledGroupBox("自動更新設定", theme=self.theme_bgtrans)
         styled_layout = QVBoxLayout()
 
         styled_layout.addWidget(StyledLabel("更新間隔 (50〜5000 ms)", theme=self.theme_bgtrans))
         self.refresh_interval_input = StyledLineEdit(
-            "例: 500", self.theme_btn_lamp,
+            "例: 500", self.theme_input,
             mode="numeric_range", min_val=50, max_val=5000
         )
         self.refresh_interval_input.setText("500")
@@ -225,11 +193,9 @@ class ESP32IOTestUI(QMainWindow):
         styled_layout.addWidget(self.response_speed_label)
 
         styled_group.setLayout(styled_layout)
-        main_row1.addWidget(styled_group)
-        main_row1.setStretch(0, 1)
-        main_row1.setStretch(1, 1)
+        return styled_group
 
-        # ===== DIO 入力（ランプ6個） =====
+    def _create_di_group(self):
         di_group = StyledGroupBox("DIO 入力 (PIN 0~5)", theme=self.theme_bgtrans)
         di_layout = QHBoxLayout()
         for i in range(6):
@@ -237,22 +203,21 @@ class ESP32IOTestUI(QMainWindow):
             self.di_lamps[i] = lamp
             di_layout.addWidget(lamp)
         di_group.setLayout(di_layout)
-        main_row2.addWidget(di_group)
+        return di_group
 
-        # ===== DIO 出力（ボタン6個） =====
+    def _create_do_group(self):
         do_group = StyledGroupBox("DIO 出力 (PIN 0~5)", theme=self.theme_bgtrans)
         do_layout = QHBoxLayout()
         for i in range(6):
             btn = IndusAlternateButton(f"PIN{i}", self.theme_btn_lamp, diameter=48)
+            # pin_id=i を使い、ループ後も各ボタンが正しいPINを参照するようにする
             btn.toggled.connect(lambda checked, pin_id=i: self.on_do_toggle(pin_id, checked))
             self.dio_buttons[i] = btn
             do_layout.addWidget(btn)
         do_group.setLayout(do_layout)
-        main_row2.addWidget(do_group)
-        main_row2.setStretch(0, 1)
-        main_row2.setStretch(1, 1)
+        return do_group
 
-        # ===== ADC 読み取り（表示 + ProgressBar） =====
+    def _create_adc_group(self):
         adc_group = StyledGroupBox("ADC 読み取り (PIN 0~1)", theme=self.theme_bgtrans)
         adc_layout = QHBoxLayout()
         for i in range(2):
@@ -280,11 +245,9 @@ class ESP32IOTestUI(QMainWindow):
             self.adc_bars[i] = bar
             adc_layout.addWidget(frame)
         adc_group.setLayout(adc_layout)
-        main_row3.addWidget(adc_group)
-        main_row3.setStretch(0, 1)
-        main_row3.setStretch(1, 1)
+        return adc_group
 
-        # ===== PWM 出力（表示） =====
+    def _create_pwm_group(self):
         pwm_group = StyledGroupBox("PWM 出力 (PIN 0~1)", theme=self.theme_bgtrans)
         pwm_layout = QHBoxLayout()
         for i in range(2):
@@ -298,6 +261,7 @@ class ESP32IOTestUI(QMainWindow):
             label.setFont(QFont("Arial", 10, QFont.Bold))
 
             slider = StyledSlider(theme=self.theme_bgtrans, min_val=0, max_val=255, value=0)
+            # pin_id=i を固定して、PINごとの送信先を崩さない
             slider.valueChanged.connect(lambda value, pin_id=i: self.on_pwm_change(pin_id, value))
 
             value_label = StyledLabel("0 / 255", theme=self.theme_bgtrans)
@@ -305,7 +269,8 @@ class ESP32IOTestUI(QMainWindow):
             value_label.setFont(QFont("Arial", 12, QFont.Bold))
             value_label.setMinimumWidth(40)
 
-            slider.valueChanged.connect(lambda value, label=value_label: label.setText(f"{value} / 255"))
+            # ラベル更新もPINごとに紐付ける
+            slider.valueChanged.connect(lambda value, pin_id=i: self.update_pwm_label(pin_id, value))
 
             layout.addWidget(label)
             layout.addWidget(slider)
@@ -317,11 +282,54 @@ class ESP32IOTestUI(QMainWindow):
         pwm_layout.setStretch(0, 1)
         pwm_layout.setStretch(1, 1)
         pwm_group.setLayout(pwm_layout)
-        main_row3.addWidget(pwm_group)
-        main_row3.setStretch(0, 1)
-        main_row3.setStretch(1, 1)
+        return pwm_group
 
-        # ===== イベントログ =====
+    def _create_pwm_config_group(self):
+        pwm_config_group = StyledGroupBox("PWM 設定", theme=self.theme_bgtrans)
+        pwm_config_layout = QVBoxLayout()
+
+        freq_layout = QHBoxLayout()
+        freq_layout.addWidget(StyledLabel("周波数 (1~20000):", theme=self.theme_bgtrans))
+        self.pwm_freq_input = StyledLineEdit(
+            "1000", self.theme_input,
+            mode="numeric_range", min_val=1, max_val=20000
+        )
+        self.pwm_freq_input.setText("1000")
+        freq_layout.addWidget(self.pwm_freq_input)
+
+        self.pwm_freq_label = StyledLabel("--", theme=self.theme_bgtrans)
+        freq_layout.addWidget(self.pwm_freq_label)
+        pwm_config_layout.addLayout(freq_layout)
+
+        res_layout = QHBoxLayout()
+        res_layout.addWidget(StyledLabel("解像度 (1~16):", theme=self.theme_bgtrans))
+        self.pwm_res_input = StyledLineEdit(
+            "8", self.theme_input,
+            mode="numeric_range", min_val=1, max_val=16
+        )
+        self.pwm_res_input.setText("8")
+        res_layout.addWidget(self.pwm_res_input)
+
+        self.pwm_res_label = StyledLabel("--", theme=self.theme_bgtrans)
+        res_layout.addWidget(self.pwm_res_label)
+        pwm_config_layout.addLayout(res_layout)
+
+        button_layout = QHBoxLayout()
+        self.pwm_config_read_btn = StyledButton("読込", theme=self.theme_btn_lamp)
+        self.pwm_config_read_btn.clicked.connect(self.read_pwm_config)
+        self.pwm_config_read_btn.setEnabled(False)
+        button_layout.addWidget(self.pwm_config_read_btn)
+
+        self.pwm_config_apply_btn = StyledButton("適用", theme=self.theme_btn_lamp)
+        self.pwm_config_apply_btn.clicked.connect(self.apply_pwm_config)
+        self.pwm_config_apply_btn.setEnabled(False)
+        button_layout.addWidget(self.pwm_config_apply_btn)
+
+        pwm_config_layout.addLayout(button_layout)
+        pwm_config_group.setLayout(pwm_config_layout)
+        return pwm_config_group
+
+    def _create_log_group(self):
         log_group = StyledGroupBox("イベントログ", theme=self.theme_bgtrans)
         log_layout = QVBoxLayout()
         self.log_text = StyledTextEdit(
@@ -332,21 +340,7 @@ class ESP32IOTestUI(QMainWindow):
         self.log_text.setMinimumHeight(120)
         log_layout.addWidget(self.log_text)
         log_group.setLayout(log_layout)
-
-
-        # main_layoutへの追加
-        main_layout.addLayout(main_row1)
-        main_layout.addLayout(main_row2)
-        main_layout.addLayout(main_row3)
-        main_layout.addWidget(log_group)
-
-        # ステータスバー
-        self.statusBar = QStatusBar()
-        self.setStatusBar(self.statusBar)
-        self.statusBar.showMessage("切断状態")
-
-        # 初期状態：ボタン無効化
-        self.set_buttons_enabled(False)
+        return log_group
 
     def append_log(self, message: str):
         """ログ表示を追加"""
@@ -417,6 +411,8 @@ class ESP32IOTestUI(QMainWindow):
             btn.setEnabled(enabled)
         for slider, _ in self.pwm_sliders.values():
             slider.setEnabled(enabled)
+        self.pwm_config_read_btn.setEnabled(enabled)
+        self.pwm_config_apply_btn.setEnabled(enabled)
         self.auto_refresh_btn.setEnabled(enabled)
 
     def on_do_toggle(self, pin_id: int, checked: bool = None):
@@ -433,6 +429,12 @@ class ESP32IOTestUI(QMainWindow):
         if not self._connected:
             return
         self._set_pwm_requested.emit(pin_id, value)
+
+    def update_pwm_label(self, pin_id: int, value: int):
+        """PWM スライダーのラベルを更新（最大値を参照）"""
+        slider, value_label = self.pwm_sliders[pin_id]
+        max_val = slider.maximum()
+        value_label.setText(f"{value} / {max_val}")
 
     def toggle_auto_refresh(self, checked: bool):
         """自動更新をトグル"""
@@ -471,7 +473,9 @@ class ESP32IOTestUI(QMainWindow):
         self.disconnect_btn.setEnabled(True)
         self.port_combo.setEnabled(False)
         self.refresh_ports_btn.setEnabled(False)
+        # 接続直後に1回取得してUIを最新状態へ同期
         self._refresh_requested.emit()
+        self._get_pwm_config_requested.emit()
 
     def _on_connection_failed(self, error: str):
         self.append_log(f"接続失敗: {error}")
@@ -515,7 +519,83 @@ class ESP32IOTestUI(QMainWindow):
     def _on_command_failed(self, error: str):
         self.append_log(error)
 
+    def _on_pwm_config_updated(self, freq: int, res: int):
+        """PWM 設定が正常に変更・取得されました"""
+        self.pwm_config_freq = freq
+        self.pwm_config_res = res
+        
+        # 解像度から最大PWM値を計算（2^res - 1）
+        max_pwm_value = (2 ** res) - 1
+        
+        # 各スライダーの最大値を更新
+        for pin_id, (slider, value_label) in self.pwm_sliders.items():
+            old_max = slider.maximum()
+            old_value = slider.value()
+            
+            # 古い最大値から新しい最大値へ値をスケーリング
+            if old_max > 0:
+                scaled_value = int(old_value * max_pwm_value / old_max)
+            else:
+                scaled_value = 0
+            
+            # スライダーの最大値を更新
+            slider.blockSignals(True)
+            slider.setMaximum(max_pwm_value)
+            slider.setValue(scaled_value)
+            slider.blockSignals(False)
+            
+            # ラベルを更新
+            value_label.setText(f"{scaled_value} / {max_pwm_value}")
+        
+        self.pwm_freq_label.setText(f"現在: {freq}")
+        self.pwm_res_label.setText(f"現在: {res}")
+        self.pwm_freq_input.setText(str(freq))
+        self.pwm_res_input.setText(str(res))
+        self.append_log(f"PWM 設定: 周波数={freq} Hz, 解像度={res} bit (最大値={max_pwm_value})")
+
+    def _on_pwm_config_failed(self, error: str):
+        """PWM 設定変更が失敗しました"""
+        self.append_log(error)
+        QMessageBox.warning(self, "エラー", f"PWM設定エラー: {error}")
+
+    def read_pwm_config(self):
+        """PWM 設定を読み込む"""
+        if not self._connected:
+            return
+        self.append_log("PWM 設定を読み込み中...")
+        self._get_pwm_config_requested.emit()
+
+    def apply_pwm_config(self):
+        """PWM 設定を適用"""
+        if not self._connected:
+            return
+        
+        try:
+            freq_text = self.pwm_freq_input.text()
+            res_text = self.pwm_res_input.text()
+            
+            if not freq_text or not res_text:
+                QMessageBox.warning(self, "エラー", "周波数と解像度を入力してください")
+                return
+            
+            freq = int(freq_text)
+            res = int(res_text)
+            
+            if not (1 <= freq <= 20000):
+                QMessageBox.warning(self, "エラー", "周波数は 1～20000 の範囲で入力してください")
+                return
+            
+            if not (1 <= res <= 16):
+                QMessageBox.warning(self, "エラー", "解像度は 1～16 の範囲で入力してください")
+                return
+            
+            self.append_log(f"PWM 設定を適用中... 周波数={freq}, 解像度={res}")
+            self._set_pwm_config_requested.emit(freq, res)
+        except ValueError:
+            QMessageBox.warning(self, "エラー", "数値を正しく入力してください")
+
     def closeEvent(self, event):
+        # 停止要求 -> スレッド終了 -> 終了待ち の順で後始末する
         self.auto_refresh_timer.stop()
         self._disconnect_requested.emit()
         self._thread.quit()
