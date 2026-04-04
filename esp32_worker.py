@@ -52,6 +52,26 @@ class ESP32Worker(QObject):
             self.esp = None
             self.disconnected.emit()
 
+    def _read_di_adc_snapshot(self):
+        """DI/ADC をなるべく同一スナップショットとして取得する。"""
+        if not self.esp:
+            return [], []
+
+        if hasattr(self.esp, "get_io_state"):
+            state = self.esp.get_io_state()
+            di_values = list(state.get("dio_in", []))
+            adc_values = list(state.get("adc", []))
+            if len(di_values) >= 6 and len(adc_values) >= 2:
+                return di_values[:6], adc_values[:2]
+
+        di_values = [self.esp.read_di(i) for i in range(6)]
+        adc_values = []
+        for i in range(2):
+            # チャンネル切替直後の古い ADC 値を避けるため、1 回目は捨てて 2 回目を採用する。
+            self.esp.read_adc(i)
+            adc_values.append(self.esp.read_adc(i))
+        return di_values, adc_values
+
     @Slot()
     def do_refresh(self):
         """DI/ADCをまとめて読み取り、計測時間付きで通知する。"""
@@ -60,8 +80,7 @@ class ESP32Worker(QObject):
         self._refreshing = True
         try:
             start = time.perf_counter()
-            di_values = [self.esp.read_di(i) for i in range(6)]
-            adc_values = [self.esp.read_adc(i) for i in range(2)]
+            di_values, adc_values = self._read_di_adc_snapshot()
             elapsed_ms = (time.perf_counter() - start) * 1000.0
             self.di_adc_updated.emit(di_values, adc_values, elapsed_ms)
         except Exception as e:
