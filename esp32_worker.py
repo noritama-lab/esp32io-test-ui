@@ -88,16 +88,16 @@ class ESP32Worker(QObject):
         except Exception as e:
             self.command_failed.emit(f"set_pwm 失敗 (PIN{pin_id}): {str(e)}")
 
+    def _emit_pwm_config(self, config: dict):
+        self.pwm_config_updated.emit(config.get("freq", 0), config.get("res", 0))
+
     @Slot()
     def do_get_pwm_config(self):
         """現在のPWM設定(周波数/解像度)を取得する。"""
         if not self.esp:
             return
         try:
-            config = self.esp.get_pwm_config()
-            freq = config.get("freq", 0)
-            res = config.get("res", 0)
-            self.pwm_config_updated.emit(freq, res)
+            self._emit_pwm_config(self.esp.get_pwm_config())
         except Exception as e:
             self.pwm_config_failed.emit(f"PWM設定取得失敗: {str(e)}")
 
@@ -107,9 +107,6 @@ class ESP32Worker(QObject):
         if not self.esp:
             return
         try:
-            config = self.esp.set_pwm_config(freq, res)
-            freq_result = config.get("freq", 0)
-            res_result = config.get("res", 0)
-            self.pwm_config_updated.emit(freq_result, res_result)
+            self._emit_pwm_config(self.esp.set_pwm_config(freq, res))
         except Exception as e:
             self.pwm_config_failed.emit(f"PWM設定変更失敗: {str(e)}")

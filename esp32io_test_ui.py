@@ -1,3 +1,4 @@
+import math
 import sys
 from PySide6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
@@ -14,6 +15,10 @@ from pyside6stylekit import (
 
 from esp32_worker import ESP32Worker
 from serial.tools import list_ports
+
+
+ESP32_S3_LEDC_CLOCK_HZ = 40_000_000
+ESP32_S3_LEDC_MAX_DIVIDER = 1024
 
 
 class ESP32IOTestUI(QMainWindow):
@@ -56,7 +61,7 @@ class ESP32IOTestUI(QMainWindow):
 
         self.setWindowTitle("ESP32IO Test UI")
         self.setGeometry(100, 100, 1000, 600)
-        self.setMinimumSize(1000, 600)
+        self.setMinimumSize(1000, 700)
 
         # UI コンポーネントの辞書
         self.dio_buttons = {}      # pin_id: IndusAlternateButton
@@ -64,8 +69,6 @@ class ESP32IOTestUI(QMainWindow):
         self.adc_labels = {}       # pin_id: StyledLabel
         self.adc_bars = {}         # pin_id: StyledProgressBar
         self.pwm_sliders = {}      # pin_id: (StyledSlider, StyledLabel)
-        self.pwm_config_freq = None  # Current PWM frequency
-        self.pwm_config_res = None   # Current PWM resolution
 
         # Worker スレッド設定
         self._worker = ESP32Worker()
@@ -261,16 +264,12 @@ class ESP32IOTestUI(QMainWindow):
             label.setFont(QFont("Arial", 10, QFont.Bold))
 
             slider = StyledSlider(theme=self.theme_bgtrans, min_val=0, max_val=255, value=0)
-            # pin_id=i を固定して、PINごとの送信先を崩さない
-            slider.valueChanged.connect(lambda value, pin_id=i: self.on_pwm_change(pin_id, value))
+            slider.valueChanged.connect(lambda value, pin_id=i: self.pwm_set(pin_id, value))
 
             value_label = StyledLabel("0 / 255", theme=self.theme_bgtrans)
             value_label.setAlignment(Qt.AlignCenter)
             value_label.setFont(QFont("Arial", 12, QFont.Bold))
             value_label.setMinimumWidth(40)
-
-            # ラベル更新もPINごとに紐付ける
-            slider.valueChanged.connect(lambda value, pin_id=i: self.update_pwm_label(pin_id, value))
 
             layout.addWidget(label)
             layout.addWidget(slider)
@@ -295,6 +294,7 @@ class ESP32IOTestUI(QMainWindow):
             mode="numeric_range", min_val=1, max_val=20000
         )
         self.pwm_freq_input.setText("1000")
+        self.pwm_freq_input.textChanged.connect(self._update_pwm_constraint_hint)
         freq_layout.addWidget(self.pwm_freq_input)
 
         self.pwm_freq_label = StyledLabel("--", theme=self.theme_bgtrans)
@@ -302,17 +302,23 @@ class ESP32IOTestUI(QMainWindow):
         pwm_config_layout.addLayout(freq_layout)
 
         res_layout = QHBoxLayout()
-        res_layout.addWidget(StyledLabel("解像度 (1~16):", theme=self.theme_bgtrans))
+        res_layout.addWidget(StyledLabel("解像度 (1~14):", theme=self.theme_bgtrans))
         self.pwm_res_input = StyledLineEdit(
             "8", self.theme_input,
-            mode="numeric_range", min_val=1, max_val=16
+            mode="numeric_range", min_val=1, max_val=14
         )
         self.pwm_res_input.setText("8")
+        self.pwm_res_input.textChanged.connect(self._update_pwm_constraint_hint)
         res_layout.addWidget(self.pwm_res_input)
 
         self.pwm_res_label = StyledLabel("--", theme=self.theme_bgtrans)
         res_layout.addWidget(self.pwm_res_label)
         pwm_config_layout.addLayout(res_layout)
+
+        self.pwm_constraint_label = StyledLabel("", theme=self.theme_bgtrans)
+        self.pwm_constraint_label.setWordWrap(True)
+        pwm_config_layout.addWidget(self.pwm_constraint_label)
+        self._update_pwm_constraint_hint()
 
         button_layout = QHBoxLayout()
         self.pwm_config_read_btn = StyledButton("読込", theme=self.theme_btn_lamp)
@@ -355,7 +361,7 @@ class ESP32IOTestUI(QMainWindow):
             try:
                 interval = int(self.refresh_interval_input.value())
             except (TypeError, ValueError):
-                interval = int(self.refresh_interval_input.edit.text() or 500)
+                interval = int(self.refresh_interval_input.text() or 500)
                 return interval, False
         else:
             self.refresh_interval_input.show_error("50〜5000 の範囲で入力してください")
@@ -424,17 +430,105 @@ class ESP32IOTestUI(QMainWindow):
         value = 1 if checked else 0
         self._set_do_requested.emit(pin_id, value)
 
-    def on_pwm_change(self, pin_id: int, value: int):
-        """PWM スライダーが変更された"""
-        if not self._connected:
-            return
-        self._set_pwm_requested.emit(pin_id, value)
-
-    def update_pwm_label(self, pin_id: int, value: int):
-        """PWM スライダーのラベルを更新（最大値を参照）"""
+    def pwm_set(self, pin_id: int, value: int, emit: bool = True):
+        """PWM の表示を更新し、必要なら送信する"""
         slider, value_label = self.pwm_sliders[pin_id]
-        max_val = slider.maximum()
-        value_label.setText(f"{value} / {max_val}")
+        value_label.setText(f"{value} / {slider.maximum()}")
+        if emit and self._connected:
+            self._set_pwm_requested.emit(pin_id, value)
+
+    def _minimum_pwm_freq_for_resolution(self, res: int) -> int:
+        if res < 1:
+            return 1
+        return max(1, math.ceil(ESP32_S3_LEDC_CLOCK_HZ / (ESP32_S3_LEDC_MAX_DIVIDER * (1 << res))))
+
+    def _minimum_pwm_resolution_for_frequency(self, freq: int) -> int:
+        if freq < 1:
+            return 15
+        for res in range(1, 15):
+            if freq >= self._minimum_pwm_freq_for_resolution(res):
+                return res
+        return 15
+
+    def _update_pwm_constraint_hint(self):
+        freq_text = self.pwm_freq_input.text().strip() if hasattr(self, "pwm_freq_input") else ""
+        res_text = self.pwm_res_input.text().strip() if hasattr(self, "pwm_res_input") else ""
+
+        try:
+            freq = int(freq_text) if freq_text else 1000
+        except ValueError:
+            freq = 1000
+
+        try:
+            res = int(res_text) if res_text else 8
+        except ValueError:
+            res = 8
+
+        min_freq = self._minimum_pwm_freq_for_resolution(res)
+        min_res = self._minimum_pwm_resolution_for_frequency(freq)
+        is_combo_valid = 1 <= res <= 14 and 1 <= freq <= 20000 and min_res <= 14 and freq >= min_freq
+
+        if min_res > 14:
+            text = (
+                f"制約目安: {freq} Hz は低すぎます。"
+                f"14 bit でも {self._minimum_pwm_freq_for_resolution(14)} Hz 以上が必要です。"
+            )
+        elif freq < min_freq:
+            text = (
+                f"制約目安: {res} bit では {min_freq} Hz 以上、"
+                f"{freq} Hz を使うなら {min_res} bit 以上が必要です。"
+            )
+        else:
+            text = f"制約目安: 現在の {freq} Hz / {res} bit は送信可能範囲です。"
+
+        if hasattr(self, "pwm_constraint_label"):
+            self.pwm_constraint_label.setText(text)
+        if hasattr(self, "pwm_config_apply_btn"):
+            self.pwm_config_apply_btn.setEnabled(self._connected and is_combo_valid)
+
+    def _get_pwm_config_values(self):
+        """PWM 設定入力を取得する"""
+        if not (self.pwm_freq_input.is_valid() and self.pwm_res_input.is_valid()):
+            QMessageBox.warning(self, "エラー", "周波数は 1～20000、解像度は 1～14 の範囲で入力してください")
+            return None
+
+        try:
+            freq = int(self.pwm_freq_input.value())
+            res = int(self.pwm_res_input.value())
+        except (TypeError, ValueError):
+            QMessageBox.warning(self, "エラー", "数値を正しく入力してください")
+            return None
+
+        self.pwm_freq_input.show_error("")
+        self.pwm_res_input.show_error("")
+
+        min_freq = self._minimum_pwm_freq_for_resolution(res)
+        min_res = self._minimum_pwm_resolution_for_frequency(freq)
+
+        if min_res > 14:
+            message = (
+                f"{freq} Hz はこの ESP32-S3 の PWM 制約では低すぎます。\n"
+                f"少なくとも {self._minimum_pwm_freq_for_resolution(14)} Hz 以上にしてください。"
+            )
+            self.pwm_freq_input.show_error("周波数が低すぎます")
+            QMessageBox.warning(self, "エラー", message)
+            self._update_pwm_constraint_hint()
+            return None
+
+        if freq < min_freq:
+            self.pwm_freq_input.show_error(f"{res} bit では {min_freq} Hz 以上")
+            self.pwm_res_input.show_error(f"{freq} Hz なら {min_res} bit 以上")
+            QMessageBox.warning(
+                self,
+                "エラー",
+                f"{freq} Hz / {res} bit はこの ESP32-S3 では設定できません。\n"
+                f"{res} bit を使うなら {min_freq} Hz 以上、"
+                f"{freq} Hz を使うなら {min_res} bit 以上にしてください。",
+            )
+            self._update_pwm_constraint_hint()
+            return None
+
+        return freq, res
 
     def toggle_auto_refresh(self, checked: bool):
         """自動更新をトグル"""
@@ -520,37 +614,27 @@ class ESP32IOTestUI(QMainWindow):
         self.append_log(error)
 
     def _on_pwm_config_updated(self, freq: int, res: int):
-        """PWM 設定が正常に変更・取得されました"""
-        self.pwm_config_freq = freq
-        self.pwm_config_res = res
-        
-        # 解像度から最大PWM値を計算（2^res - 1）
-        max_pwm_value = (2 ** res) - 1
-        
-        # 各スライダーの最大値を更新
-        for pin_id, (slider, value_label) in self.pwm_sliders.items():
-            old_max = slider.maximum()
-            old_value = slider.value()
-            
-            # 古い最大値から新しい最大値へ値をスケーリング
-            if old_max > 0:
-                scaled_value = int(old_value * max_pwm_value / old_max)
-            else:
-                scaled_value = 0
-            
-            # スライダーの最大値を更新
+        """PWM 設定の表示とスライダー範囲を更新"""
+        max_pwm_value = max((1 << res) - 1, 0)
+        if res >= 14 and max_pwm_value > 0:
+            max_pwm_value -= 1
+
+        for pin_id, (slider, _) in self.pwm_sliders.items():
+            old_max = max(slider.maximum(), 1)
+            scaled_value = slider.value() * max_pwm_value // old_max
+
             slider.blockSignals(True)
-            slider.setMaximum(max_pwm_value)
+            slider.setRange(0, max_pwm_value)
             slider.setValue(scaled_value)
             slider.blockSignals(False)
-            
-            # ラベルを更新
-            value_label.setText(f"{scaled_value} / {max_pwm_value}")
-        
+
+            self.pwm_set(pin_id, scaled_value)
+
         self.pwm_freq_label.setText(f"現在: {freq}")
         self.pwm_res_label.setText(f"現在: {res}")
         self.pwm_freq_input.setText(str(freq))
         self.pwm_res_input.setText(str(res))
+        self._update_pwm_constraint_hint()
         self.append_log(f"PWM 設定: 周波数={freq} Hz, 解像度={res} bit (最大値={max_pwm_value})")
 
     def _on_pwm_config_failed(self, error: str):
@@ -569,30 +653,14 @@ class ESP32IOTestUI(QMainWindow):
         """PWM 設定を適用"""
         if not self._connected:
             return
-        
-        try:
-            freq_text = self.pwm_freq_input.text()
-            res_text = self.pwm_res_input.text()
-            
-            if not freq_text or not res_text:
-                QMessageBox.warning(self, "エラー", "周波数と解像度を入力してください")
-                return
-            
-            freq = int(freq_text)
-            res = int(res_text)
-            
-            if not (1 <= freq <= 20000):
-                QMessageBox.warning(self, "エラー", "周波数は 1～20000 の範囲で入力してください")
-                return
-            
-            if not (1 <= res <= 16):
-                QMessageBox.warning(self, "エラー", "解像度は 1～16 の範囲で入力してください")
-                return
-            
-            self.append_log(f"PWM 設定を適用中... 周波数={freq}, 解像度={res}")
-            self._set_pwm_config_requested.emit(freq, res)
-        except ValueError:
-            QMessageBox.warning(self, "エラー", "数値を正しく入力してください")
+
+        config = self._get_pwm_config_values()
+        if not config:
+            return
+
+        freq, res = config
+        self.append_log(f"PWM 設定を適用中... 周波数={freq}, 解像度={res}")
+        self._set_pwm_config_requested.emit(freq, res)
 
     def closeEvent(self, event):
         # 停止要求 -> スレッド終了 -> 終了待ち の順で後始末する
